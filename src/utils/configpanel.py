@@ -23,7 +23,7 @@ from collections import OrderedDict
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Iterator, Literal, Sequence, Type, Union, cast
 
-from pydantic import BaseModel, Extra, validator
+from pydantic import BaseModel, Extra, field_validator
 
 from moulinette import Moulinette, m18n
 from moulinette.interfaces.cli import colorize
@@ -126,13 +126,13 @@ class SectionModel(ContainerModel, OptionsModel):
     is_action_section: bool = False
     bind: Union[str, None] = None
 
-    class Config:
-        @staticmethod
-        def schema_extra(schema: dict[str, Any]) -> None:
-            del schema["properties"]["id"]
-            options = schema["properties"].pop("options")
-            del schema["required"]
-            schema["additionalProperties"] = options["items"]
+    # class Config:
+    #     @staticmethod
+    #     def schema_extra(schema: dict[str, Any]) -> None:
+    #         del schema["properties"]["id"]
+    #         options = schema["properties"].pop("options")
+    #         del schema["required"]
+    #         schema["additionalProperties"] = options["items"]
 
     # Don't forget to pass arguments to super init
     def __init__(
@@ -177,7 +177,7 @@ class SectionModel(ContainerModel, OptionsModel):
         self.translate_options(i18n_key)
 
 
-class PanelModel(ContainerModel):
+class PanelModel(ContainerModel, extra='allow'):
     """
     Panels are, basically, sections grouped together. Panels are `dict`s defined inside a ConfigPanel file and require a unique id (in the below example, the id is `main`). Keep in mind that this id will be used in CLI to refer to the panel, so choose something short and meaningfull.
 
@@ -205,15 +205,15 @@ class PanelModel(ContainerModel):
     bind: Union[str, None] = None
     sections: list[SectionModel]
 
-    class Config:
-        extra = Extra.allow
+    # class Config:
+    #     extra = Extra.allow
 
-        @staticmethod
-        def schema_extra(schema: dict[str, Any]) -> None:
-            del schema["properties"]["id"]
-            del schema["properties"]["sections"]
-            del schema["required"]
-            schema["additionalProperties"] = {"$ref": "#/definitions/SectionModel"}
+    #     @staticmethod
+    #     def schema_extra(schema: dict[str, Any]) -> None:
+    #         del schema["properties"]["id"]
+    #         del schema["properties"]["sections"]
+    #         del schema["required"]
+    #         schema["additionalProperties"] = {"$ref": "#/definitions/SectionModel"}
 
     # Don't forget to pass arguments to super init
     def __init__(
@@ -240,7 +240,7 @@ class PanelModel(ContainerModel):
             section.translate(i18n_key)
 
 
-class ConfigPanelModel(BaseModel):
+class ConfigPanelModel(BaseModel, extra='allow'):
     """
     This is the 'root' level of the config panel toml file
 
@@ -265,29 +265,29 @@ class ConfigPanelModel(BaseModel):
     i18n: Union[str, None] = None
     panels: list[PanelModel]
 
-    class Config:
-        arbitrary_types_allowed = True
-        extra = Extra.allow
+    # class Config:
+    #     arbitrary_types_allowed = True
+    #     extra = Extra.allow
 
-        @staticmethod
-        def schema_extra(schema: dict[str, Any]) -> None:
-            """Update the schema to the expected input
-            In actual TOML definition, schema is like:
-            ```toml
-            [panel_1]
-                [panel_1.section_1]
-                    [panel_1.section_1.option_1]
-            ```
-            Which is equivalent to `{"panel_1": {"section_1": {"option_1": {}}}}`
-            so `section_id` (and `option_id`) are additional property of `panel_id`,
-            which is convinient to write but not ideal to iterate.
-            In ConfigPanelModel we gather additional properties of panels, sections
-            and options as lists so that structure looks like:
-            `{"panels`: [{"id": "panel_1", "sections": [{"id": "section_1", "options": [{"id": "option_1"}]}]}]
-            """
-            del schema["properties"]["panels"]
-            del schema["required"]
-            schema["additionalProperties"] = {"$ref": "#/definitions/PanelModel"}
+    #     @staticmethod
+    #     def schema_extra(schema: dict[str, Any]) -> None:
+    #         """Update the schema to the expected input
+    #         In actual TOML definition, schema is like:
+    #         ```toml
+    #         [panel_1]
+    #             [panel_1.section_1]
+    #                 [panel_1.section_1.option_1]
+    #         ```
+    #         Which is equivalent to `{"panel_1": {"section_1": {"option_1": {}}}}`
+    #         so `section_id` (and `option_id`) are additional property of `panel_id`,
+    #         which is convinient to write but not ideal to iterate.
+    #         In ConfigPanelModel we gather additional properties of panels, sections
+    #         and options as lists so that structure looks like:
+    #         `{"panels`: [{"id": "panel_1", "sections": [{"id": "section_1", "options": [{"id": "option_1"}]}]}]
+    #         """
+    #         del schema["properties"]["panels"]
+    #         del schema["required"]
+    #         schema["additionalProperties"] = {"$ref": "#/definitions/PanelModel"}
 
     # Don't forget to pass arguments to super init
     def __init__(
@@ -357,7 +357,7 @@ class ConfigPanelModel(BaseModel):
         for panel in self.panels:
             panel.translate(self.i18n)
 
-    @validator("version", always=True)
+    @field_validator("version")
     def check_version(cls, value: float, field: "ModelField") -> float:
         if value < CONFIG_PANEL_VERSION_SUPPORTED:
             raise ValueError(

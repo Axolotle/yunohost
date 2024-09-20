@@ -16,11 +16,14 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
+from rich import print
 import sys
 import os
 import string
 import subprocess
 import yaml
+from typing import Any, Literal, get_args
+from dataclasses import dataclass
 
 SMALL_PWD_LIST = [
     "yunohost",
@@ -51,6 +54,29 @@ STRENGTH_LEVELS = [
 ]
 
 
+def redact_value(value):
+    import urllib.parse
+    from yunohost.log import OperationLogger
+
+    # Tell the operation_logger to redact all password-type / secret args
+    # Also redact the % escaped version of the password that might appear in
+    # the 'args' section of metadata (relevant for password with non-alphanumeric char)
+    data_to_redact = []
+    if value and isinstance(value, str):
+        data_to_redact.append(value)
+
+    data_to_redact += [
+        urllib.parse.quote(data)
+        for data in data_to_redact
+        if urllib.parse.quote(data) != data
+    ]
+
+    for operation_logger in OperationLogger._instances:
+        operation_logger.data_to_redact.extend(data_to_redact)
+
+    return value
+
+
 def assert_password_is_compatible(password):
     """
     UNIX seems to not like password longer than 127 chars ...
@@ -67,54 +93,45 @@ def assert_password_is_compatible(password):
         raise YunohostValidationError("password_too_long")
 
 
-def assert_password_is_strong_enough(profile, password):
-    PasswordValidator(profile).validate(password)
+Profile = Literal["user", "admin"]
 
 
-class PasswordValidator:
-    def __init__(self, profile):
-        """
-        Initialize a password validator.
+def assert_password_is_strong_enough(profile: Profile, password: str | None):
+    from typing import Annotated
+    from pydantic import TypeAdapter
 
-        The profile shall be either "user" or "admin"
-        and will correspond to a validation strength
-        defined via the setting "security.password.<profile>_strength"
-        """
+    return TypeAdapter(
+        Annotated[str, PasswordConstraints(profile=profile)]
+    ).validate_python(password)
 
-        self.profile = profile
-        try:
-            # We do this "manually" instead of using settings_get()
-            # from settings.py because this file is also meant to be
-            # use as a script by ssowat.
-            # (or at least that's my understanding -- Alex)
-            settings = yaml.safe_load(open("/etc/yunohost/settings.yml", "r"))
-            setting_key = profile + "_strength"
-            self.validation_strength = int(settings[setting_key])
-        except Exception:
-            # Fallback to default value if we can't fetch settings for some reason
-            self.validation_strength = 1
 
-    def validate(self, password):
-        """
-        Check the validation_summary and trigger an exception
-        if the password does not pass tests.
+def get_validation_strength(profile: Profile):
+    try:
+        # We do this "manually" instead of using settings_get()
+        # from settings.py because this file is also meant to be
+        # use as a script by ssowat.
+        # (or at least that's my understanding -- Alex)
+        settings = yaml.safe_load(open("/etc/yunohost/settings.yml", "r"))
+        setting_key = profile + "_strength"
+        return int(settings[setting_key])
+    except Exception:
+        # Fallback to default value if we can't fetch settings for some reason
+        return 1
 
-        This method is meant to be used from inside YunoHost's code
-        (compared to validation_summary which is meant to be called
-        by ssowat)
-        """
-        if self.validation_strength == -1:
-            return
 
-        # Note that those imports are made here and can't be put
-        # on top (at least not the moulinette ones)
-        # because the moulinette needs to be correctly initialized
-        # as well as modules available in python's path.
-        from yunohost.utils.error import YunohostValidationError
+@dataclass
+class PasswordConstraints:
+    """
+    Initialize a password validator.
 
-        status, msg = self.validation_summary(password)
-        if status == "error":
-            raise YunohostValidationError(msg)
+    The profile shall be either "user" or "admin"
+    and will correspond to a validation strength
+    defined via the setting "security.password.<profile>_strength"
+    """
+
+    profile: Profile = "user"
+    validation_strength: int = 1
+    forbidden_chars: str | None = None
 
     def validation_summary(self, password):
         """
@@ -125,39 +142,73 @@ class PasswordValidator:
         Produces a summary-tuple comprised of a level (succes or error)
         and a message key describing the issues found.
         """
+        self.validation_strength = get_validation_strength(self.profile)
+
         if self.validation_strength < 0:
             return ("success", "")
 
-        listed = password in SMALL_PWD_LIST or self.is_in_most_used_list(password)
-        strength_level = self.strength_level(password)
-        if listed:
-            # i18n: password_listed
-            return ("error", "password_listed")
-        if strength_level < self.validation_strength:
-            # i18n: password_too_simple_1
-            # i18n: password_too_simple_2
-            # i18n: password_too_simple_3
-            # i18n: password_too_simple_4
-            return ("error", "password_too_simple_%s" % self.validation_strength)
+        try:
+            self.assert_strong_enough(password)
+            self.assert_not_in_most_used_list(password)
+        except ValueError as e:
+            return ("error", e.msg)
 
         return ("success", "")
 
-    def strength(self, password):
+    def __get_pydantic_core_schema__(self, source_type, handler):
+        from pydantic_core import core_schema
+
+        self.validation_strength = get_validation_strength(self.profile)
+        nullable = type(None) in get_args(source_type)
+
+        def strip_and_parse_empty_str_to_none(v: Any):
+            if isinstance(v, str):
+                v = v.strip()
+                return None if v == "" else v
+            return v
+
+        schema = core_schema.chain_schema(
+            [
+                core_schema.is_instance_schema(str),
+                core_schema.no_info_plain_validator_function(
+                    self.assert_strong_enough,
+                ),
+                core_schema.no_info_plain_validator_function(
+                    self.assert_not_in_most_used_list
+                ),
+                core_schema.no_info_plain_validator_function(redact_value),
+            ]
+        )
+        schema = core_schema.nullable_schema(schema) if nullable else schema
+        return core_schema.no_info_before_validator_function(
+            strip_and_parse_empty_str_to_none, schema
+        )
+
+    def assert_strong_enough(self, value: str) -> str:
         """
         Returns the strength of a password, defined as a tuple
         containing the length of the password, the number of digits,
         lowercase letters, uppercase letters, and other characters.
 
         For instance, "PikachuDu67" is (11, 2, 7, 2, 0)
+
+        Computes the strength of a password and compares
+        it to the STRENGTH_LEVELS.
+
+        Returns an int corresponding to the highest STRENGTH_LEVEL
+        satisfied by the password.
         """
 
-        length = len(password)
+        if any(char in value for char in (self.forbidden_chars or "")):
+            raise ValueError(f"forbidden characters in string: {self.forbidden_chars}")
+
+        length = len(value)
         digits = 0
         uppers = 0
         lowers = 0
         others = 0
 
-        for character in password:
+        for character in value:
             if character in string.digits:
                 digits = digits + 1
             elif character in string.ascii_uppercase:
@@ -167,18 +218,7 @@ class PasswordValidator:
             else:
                 others = others + 1
 
-        return (length, digits, lowers, uppers, others)
-
-    def strength_level(self, password):
-        """
-        Computes the strength of a password and compares
-        it to the STRENGTH_LEVELS.
-
-        Returns an int corresponding to the highest STRENGTH_LEVEL
-        satisfied by the password.
-        """
-
-        strength = self.strength(password)
+        strength = (length, digits, lowers, uppers, others)
 
         strength_level = 0
         # Iterate over each level and its criterias
@@ -192,9 +232,19 @@ class PasswordValidator:
             # Otherwise, the strength of the password is at least of the current level.
             strength_level = level + 1
 
-        return strength_level
+        if strength_level < self.validation_strength:
+            # i18n: password_too_simple_1
+            # i18n: password_too_simple_2
+            # i18n: password_too_simple_3
+            # i18n: password_too_simple_4
+            raise ValueError(f"password_too_simple_{self.validation_strength}")
 
-    def is_in_most_used_list(self, password):
+        return value
+
+    def assert_not_in_most_used_list(self, value: str) -> str:
+        if value in SMALL_PWD_LIST:
+            raise ValueError("password_listed")
+
         # Decompress file if compressed
         if os.path.exists("%s.gz" % MOST_USED_PASSWORDS):
             os.system("gzip -fd %s.gz" % MOST_USED_PASSWORDS)
@@ -204,8 +254,13 @@ class PasswordValidator:
         # stdin to avoid it being shown in ps -ef --forest...
         command = "grep -q -F -f - %s" % MOST_USED_PASSWORDS
         p = subprocess.Popen(command.split(), stdin=subprocess.PIPE)
-        p.communicate(input=password.encode("utf-8"))
-        return not bool(p.returncode)
+        p.communicate(input=value.encode("utf-8"))
+
+        if not bool(p.returncode):
+            # i18n: password_listed
+            raise ValueError("password_listed")
+
+        return value
 
 
 # This file is also meant to be used as an executable by
@@ -219,6 +274,6 @@ if __name__ == "__main__":
         # print("usage: password.py PASSWORD")
     else:
         pwd = sys.argv[1]
-    status, msg = PasswordValidator("user").validation_summary(pwd)
+    status, msg = PasswordConstraints(profile="user").validation_summary(pwd)
     print(msg)
     sys.exit(0)

@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
+from rich import print
 import ast
 import datetime
 import operator as op
@@ -24,6 +25,7 @@ import re
 import shutil
 import tempfile
 import urllib.parse
+from pathlib import Path
 from enum import Enum
 from logging import getLogger
 from typing import (
@@ -39,18 +41,27 @@ from typing import (
     Type,
     Union,
 )
+from typing_extensions import TypedDict
 
 from pydantic import (
     BaseModel,
     Extra,
     ValidationError,
     create_model,
-    validator,
-    root_validator,
+    field_validator,
+    model_validator,
+    AfterValidator,
+    WrapValidator,
+    BeforeValidator,
+    PlainSerializer,
+    Strict,
 )
-from pydantic.color import Color
+from pydantic_extra_types.color import Color
+
+
+# from pydantic.color import Color
 from pydantic.fields import Field
-from pydantic.networks import EmailStr, HttpUrl
+from pydantic.networks import EmailStr, HttpUrl, Url, UrlConstraints
 from pydantic.types import constr
 
 from moulinette import Moulinette, m18n
@@ -59,6 +70,17 @@ from moulinette.utils.filesystem import read_yaml, write_to_file
 from yunohost.log import OperationLogger
 from yunohost.utils.error import YunohostError, YunohostValidationError
 from yunohost.utils.i18n import _value_for_locale
+from yunohost.utils.validators import (
+    StringConstraints,
+    BoolConstraints,
+    Str_strip_as_none,
+    TRUTHY_VALUES,
+    FALSY_VALUES,
+    DatetimeConstraints,
+    ListConstraints,
+    FileConstraints
+)
+from yunohost.utils.password import PasswordConstraints, redact_value
 
 if TYPE_CHECKING:
     from pydantic.fields import ModelField, FieldInfo
@@ -71,7 +93,6 @@ logger = getLogger("yunohost.form")
 # │  ├─╴│╭╯├─┤│                                           │
 # │  ╰─╴╰╯ ╵ ╵╰─╴                                         │
 # ╰───────────────────────────────────────────────────────╯
-
 
 # Those js-like evaluate functions are used to eval safely visible attributes
 # The goal is to evaluate in the same way than js simple-evaluate
@@ -300,7 +321,7 @@ Values = dict[str, Any]
 Mode = Literal["python", "bash"]
 
 
-class Pattern(BaseModel):
+class Pattern(TypedDict):
     regexp: str
     error: Translation = "pydantic.value_error.str.regex"  # FIXME add generic i18n key
 
@@ -368,46 +389,53 @@ class BaseOption(BaseModel):
     bind: Union[str, None] = None
     name: Union[str, None] = None  # LEGACY (replaced by `id`)
 
-    class Config:
-        arbitrary_types_allowed = True
-        use_enum_values = True
-        validate_assignment = True
-        extra = Extra.forbid
+    # class Config:
+    #     arbitrary_types_allowed = True
+    #     use_enum_values = True
+    #     validate_assignment = True
+    #     extra = Extra.forbid
 
-        @staticmethod
-        def schema_extra(schema: dict[str, Any]) -> None:
-            del schema["properties"]["id"]
-            del schema["properties"]["name"]
-            schema["required"] = [
-                required for required in schema.get("required", []) if required != "id"
-            ]
-            if not schema["required"]:
-                del schema["required"]
+    #     @staticmethod
+    #     def schema_extra(schema: dict[str, Any]) -> None:
+    #         del schema["properties"]["id"]
+    #         del schema["properties"]["name"]
+    #         schema["required"] = [
+    #             required for required in schema.get("required", []) if required != "id"
+    #         ]
+    #         if not schema["required"]:
+    #             del schema["required"]
 
-    @validator("id", pre=True)
+    @field_validator("id")
     def check_id_is_not_forbidden(cls, value: str) -> str:
         if value in FORBIDDEN_KEYWORDS:
             raise ValueError(m18n.n("config_forbidden_keyword", keyword=value))
         return value
 
-    # FIXME Legacy, is `name` still needed?
-    @validator("name")
-    def apply_legacy_name(cls, value: Union[str, None], values: Values) -> str:
+    @field_validator("ask", mode="before")
+    def id_for_ask_if_missing(cls, value: str, info) -> str:
         if value is None:
-            return values["id"]
+            return info.data.id
         return value
 
-    @validator("readonly", pre=True)
-    def can_be_readonly(cls, value: bool, values: Values) -> bool:
-        if value is True and values["type"] in FORBIDDEN_READONLY_TYPES:
-            raise ValueError(
-                m18n.n(
-                    "config_forbidden_readonly_type",
-                    type=values["type"],
-                    id=values["id"],
-                )
-            )
-        return value
+    # FIXME Legacy, is `name` still needed?
+    # @field_validator("name")
+    # def apply_legacy_name(cls, value: Union[str, None], values: Values) -> str:
+    #     if value is None:
+    #         return values["id"]
+    #     return value
+
+    # FIXME Remove?
+    # @field_validator("readonly")
+    # def can_be_readonly(cls, value: bool, values: Values) -> bool:
+    #     if value is True and values["type"] in FORBIDDEN_READONLY_TYPES:
+    #         raise ValueError(
+    #             m18n.n(
+    #                 "config_forbidden_readonly_type",
+    #                 type=values["type"],
+    #                 id=values["id"],
+    #             )
+    #         )
+    #     return value
 
     def is_visible(self, context: Context) -> bool:
         if isinstance(self.visible, bool):
@@ -601,14 +629,18 @@ class BaseInputOption(BaseOption):
     redact: bool = False
     optional: bool = False  # FIXME keep required as default?
     default: Any = None
-    _annotation = Any
+    # _annotation: Any
     _none_as_empty_str: bool = True
 
-    @validator("default", pre=True)
-    def check_empty_default(value: Any) -> Any:
-        if value == "":
-            return None
-        return value
+    @property
+    def _annotation(self) -> Any:
+        pass
+
+    # @field_validator("default", pre=True)
+    # def check_empty_default(value: Any) -> Any:
+    #     if value == "":
+    #         return None
+    #     return value
 
     @staticmethod
     def humanize(value: Any, option={}) -> str:
@@ -729,24 +761,74 @@ class BaseInputOption(BaseOption):
 
 
 class BaseStringOption(BaseInputOption):
-    default: Union[str, None]
+    # FIXME:
+    # - pattern error message
+    default: str | None = None
     pattern: Union[Pattern, None] = None
-    _annotation = str
+    # _annotation = str
+
+    # FIXME new
+    _multiline: bool | None = None
+    strip_whitespace: bool | None = None
+    to_upper: bool | None = None
+    to_lower: bool | None = None
+    min_length: int | None = None
+    max_length: int | None = None
+    forbidden_chars: str | None = None
+    choices: list[str] | None = None
+    multiple: bool | None = None
 
     @property
-    def _dynamic_annotation(self) -> Type[str]:
-        if self.pattern:
-            return constr(regex=self.pattern.regexp)
+    def _annotation(self):
+        # FIXME choices as dict or list or dicts
+        anno = str if self.choices is None else Literal[tuple(self.choices)]
+        # anno = anno if not self.multiple else list[anno]
 
-        return self._annotation
+        anno = (
+            anno,
+            StringConstraints(
+                strip_whitespace=self.strip_whitespace,
+                to_upper=self.to_upper,
+                to_lower=self.to_lower,
+                min_length=self.min_length if self.optional else 1,
+                max_length=self.max_length,
+                pattern=self.pattern.dict() if self.pattern else None,
+                forbidden_chars=self.forbidden_chars,
+                multiline=self._multiline,
+                empty_str_is_none=True,
+            ),
+            # Redact if self.redact else None,
+        )
+        if self.multiple:
+            anno = Annotated[anno[0], anno[1]]
+            return Annotated[
+                list[anno] if not self.optional else list[anno] | None,
+                ListConstraints(),
+            ]  # FIXME
 
-    def _get_field_attrs(self) -> dict[str, Any]:
-        attrs = super()._get_field_attrs()
+        return Annotated[anno[0] if not self.optional else anno[0] | None, anno[1]]
 
-        if self.pattern:
-            attrs["regex_error"] = self.pattern.error  # extra
+    # @field_validator("default", mode="before")
+    # @staticmethod
+    # def coerce_default_none_to_empty_string(value: str | None) -> str:
+    #     if value is None:
+    #         return ""
+    #     return value
 
-        return attrs
+    # @property
+    # def _dynamic_annotation(self) -> Type[str]:
+    #     if self.pattern:
+    #         return constr(regex=self.pattern.regexp)
+
+    #     return self._annotation
+
+    # def _get_field_attrs(self) -> dict[str, Any]:
+    #     attrs = super()._get_field_attrs()
+
+    #     if self.pattern:
+    #         attrs["regex_error"] = self.pattern.error  # extra
+
+    #     return attrs
 
 
 class StringOption(BaseStringOption):
@@ -769,6 +851,8 @@ class StringOption(BaseStringOption):
     """
 
     type: Literal[OptionType.string] = OptionType.string
+    strip_whitespace: bool | None = True
+    _multiline: Literal[False] = False
 
 
 class TextOption(BaseStringOption):
@@ -789,6 +873,7 @@ class TextOption(BaseStringOption):
     """
 
     type: Literal[OptionType.text] = OptionType.text
+    _multiline: Literal[True] = True
 
 
 FORBIDDEN_PASSWORD_CHARS = r"{}"
@@ -815,35 +900,38 @@ class PasswordOption(BaseInputOption):
     example: Literal[None] = None
     default: Literal[None] = None
     redact: Literal[True] = True
-    _annotation = str
-    _forbidden_chars: str = FORBIDDEN_PASSWORD_CHARS
+    profile: Literal["user", "admin"] = "user"
+    forbidden_chars: str = "{}\n"
 
-    def _get_field_attrs(self) -> dict[str, Any]:
-        attrs = super()._get_field_attrs()
+    @property
+    def _annotation(self):
+        return Annotated[
+            str if not self.optional else str | None,
+            PasswordConstraints(
+                profile=self.profile,
+                forbidden_chars=self.forbidden_chars,
+            ),
+        ]
 
-        attrs["forbidden_chars"] = self._forbidden_chars  # extra
+    # @classmethod
+    # def _value_pre_validator(
+    #     cls, value: Union[str, None], field: "ModelField"
+    # ) -> Union[str, None]:
+    #     value = super()._value_pre_validator(value, field)
 
-        return attrs
+    #     if value is not None and value != "":
+    #         forbidden_chars: str = field.field_info.extra["forbidden_chars"]
+    #         if any(char in value for char in forbidden_chars):
+    #             raise YunohostValidationError(
+    #                 "pattern_password_app", forbidden_chars=forbidden_chars
+    #             )
 
-    @classmethod
-    def _value_pre_validator(
-        cls, value: Union[str, None], field: "ModelField"
-    ) -> Union[str, None]:
-        value = super()._value_pre_validator(value, field)
+    #         # If it's an optional argument the value should be empty or strong enough
+    #         from yunohost.utils.password import assert_password_is_strong_enough
 
-        if value is not None and value != "":
-            forbidden_chars: str = field.field_info.extra["forbidden_chars"]
-            if any(char in value for char in forbidden_chars):
-                raise YunohostValidationError(
-                    "pattern_password_app", forbidden_chars=forbidden_chars
-                )
+    #         assert_password_is_strong_enough("user", value)
 
-            # If it's an optional argument the value should be empty or strong enough
-            from yunohost.utils.password import assert_password_is_strong_enough
-
-            assert_password_is_strong_enough("user", value)
-
-        return value
+    #     return value
 
 
 class ColorOption(BaseInputOption):
@@ -863,8 +951,17 @@ class ColorOption(BaseInputOption):
     """
 
     type: Literal[OptionType.color] = OptionType.color
-    default: Union[str, None]
-    _annotation = Color
+    default: Union[str, None] = None
+
+    @property
+    def _annotation(self):
+        return Annotated[
+            Color if not self.optional else Color | None,
+            Str_strip_as_none,  # Replace with single BeforeValidator ?
+            PlainSerializer(
+                lambda v: v.as_hex(), return_type=str, when_used="unless-none"
+            ),
+        ]
 
     @staticmethod
     def humanize(value: Union[Color, str, None], option={}) -> str:
@@ -916,12 +1013,20 @@ class NumberOption(BaseInputOption):
 
     # `number` and `range` are exactly the same, but `range` does render as a slider in web-admin
     type: Literal[OptionType.number, OptionType.range] = OptionType.number
-    default: Union[int, None]
+    default: Union[int, None] = None
     min: Union[int, None] = None
     max: Union[int, None] = None
     step: Union[int, None] = None
-    _annotation = int
-    _none_as_empty_str = False
+    # _annotation = int
+    # _none_as_empty_str = False
+
+    @property
+    def _annotation(self):
+        return Annotated[
+            int if not self.optional else int | None,
+            Field(ge=self.min, le=self.max, multiple_of=self.step),
+            Str_strip_as_none,
+        ]
 
     @staticmethod
     def normalize(value, option={}) -> Union[int, None]:
@@ -993,10 +1098,27 @@ class BooleanOption(BaseInputOption):
     yes: Any = 1
     no: Any = 0
     default: Union[bool, int, str, None] = 0
-    _annotation = Union[bool, int, str]
-    _yes_answers: set[str] = {"1", "yes", "y", "true", "t", "on"}
-    _no_answers: set[str] = {"0", "no", "n", "false", "f", "off"}
-    _none_as_empty_str = False
+    # _annotation = Union[bool, int, str]
+    # _yes_answers: set[str] = {"1", "yes", "y", "true", "t", "on"}
+    # _no_answers: set[str] = {"0", "no", "n", "false", "f", "off"}
+    # _none_as_empty_str = False
+
+    @property
+    def _annotation(self):
+        return Annotated[
+            bool if not self.optional else bool | None,
+            BoolConstraints(serialization=(self.yes, self.no)),
+            Str_strip_as_none,  # As always, treats `" \n"` as `None`
+        ]
+
+    @field_validator("yes", "no")
+    @staticmethod
+    def assert_no_inversion(value: Any, info):
+        values = FALSY_VALUES if info.field_name == "yes" else TRUTHY_VALUES
+        if value in values:
+            raise ValueError(f"'{info.field_name}' can't be in {values}")
+
+        return value
 
     @staticmethod
     def humanize(value, option={}) -> str:
@@ -1112,8 +1234,14 @@ class DateOption(BaseInputOption):
     """
 
     type: Literal[OptionType.date] = OptionType.date
-    default: Union[str, None]
-    _annotation = datetime.date
+    default: Union[str, None] = None
+
+    @property
+    def _annotation(self):
+        return Annotated[
+            datetime.date if not self.optional else datetime.date | None,
+            DatetimeConstraints(type="date"),
+        ]
 
     @classmethod
     def _value_post_validator(
@@ -1142,8 +1270,15 @@ class TimeOption(BaseInputOption):
     """
 
     type: Literal[OptionType.time] = OptionType.time
-    default: Union[str, int, None]
-    _annotation = datetime.time
+    default: Union[str, int, None] = None
+    # _annotation = datetime.time
+
+    @property
+    def _annotation(self) -> Annotated:
+        return Annotated[
+            datetime.time if not self.optional else datetime.time | None,
+            DatetimeConstraints(type="time", strftime="%H:%M"),
+        ]
 
     @classmethod
     def _value_post_validator(
@@ -1175,8 +1310,23 @@ class EmailOption(BaseInputOption):
     """
 
     type: Literal[OptionType.email] = OptionType.email
-    default: Union[EmailStr, None]
-    _annotation = EmailStr
+    default: Annotated[Union[EmailStr, None], Str_strip_as_none] = None
+    # _annotation = EmailStr
+
+    @property
+    def _annotation(self):
+        return Annotated[
+            EmailStr if not self.optional else EmailStr | None, Str_strip_as_none
+        ]
+
+
+def serialize_webpath(value: str | None) -> str | None:
+    if isinstance(value, str):
+        return "/" + value.strip().strip(" /")
+
+    return value
+
+    print("SER", value, type(value))
 
 
 class WebPathOption(BaseStringOption):
@@ -1196,6 +1346,17 @@ class WebPathOption(BaseStringOption):
     """
 
     type: Literal[OptionType.path] = OptionType.path
+    default: str | None = None
+
+    @property
+    def _annotation(self):
+        # FIXME could use AnyHttpUrl with fake host and scheme then serialize to `AnyHttpUrl.path`
+        return Annotated[
+            str if not self.optional else str | None,
+            Strict(),
+            Str_strip_as_none,
+            PlainSerializer(serialize_webpath),
+        ]
 
     @staticmethod
     def normalize(value, option={}) -> str:
@@ -1244,7 +1405,16 @@ class URLOption(BaseStringOption):
     """
 
     type: Literal[OptionType.url] = OptionType.url
-    _annotation = HttpUrl
+    # _annotation = HttpUrl
+
+    @property
+    def _annotation(self):
+        return Annotated[
+            HttpUrl if not self.optional else HttpUrl | None,
+            # Strict(),
+            Str_strip_as_none,
+            # PlainSerializer(serialize_webpath),
+        ]
 
 
 # ─ FILE ──────────────────────────────────────────────────
@@ -1275,36 +1445,34 @@ class FileOption(BaseInputOption):
     # `bytes` for API (a base64 encoded file actually)
     accept: Union[list[str], None] = None  # currently only used by the web-admin
     default: Union[str, None]
-    _annotation = str  # TODO could be Path at some point
-    _upload_dirs: set[str] = set()
+    # _annotation = str  # TODO could be Path at some point
+    # _upload_dirs: set[str] = set()
 
     @property
-    def _validators(self) -> dict[str, Callable]:
-        return {
-            "pre": self._value_pre_validator,
-            "post": (
-                self._bash_value_post_validator
-                if self.mode == "bash"
-                else self._python_value_post_validator
-            ),
-        }
+    def _annotation(self):
+        # FIXME use "mode" in file constraint + add mode handling in FileConstraints
+        return Annotated[
+            Path if not self.optional else Path | None,
+            FileConstraints(accept=self.accept),
+        ]
 
-    def _get_field_attrs(self) -> dict[str, Any]:
-        attrs = super()._get_field_attrs()
+    # @property
+    # def _validators(self) -> dict[str, Callable]:
+    #     return {
+    #         "pre": self._value_pre_validator,
+    #         "post": (
+    #             self._bash_value_post_validator
+    #             if self.mode == "bash"
+    #             else self._python_value_post_validator
+    #         ),
+    #     }
 
-        if self.accept:
-            attrs["accept"] = self.accept  # extra
-
-        attrs["bind"] = self.bind
-
-        return attrs
-
-    @classmethod
-    def clean_upload_dirs(cls) -> None:
-        # Delete files uploaded from API
-        for upload_dir in cls._upload_dirs:
-            if os.path.exists(upload_dir):
-                shutil.rmtree(upload_dir)
+    # @classmethod
+    # def clean_upload_dirs(cls) -> None:
+    #     # Delete files uploaded from API
+    #     for upload_dir in cls._upload_dirs:
+    #         if os.path.exists(upload_dir):
+    #             shutil.rmtree(upload_dir)
 
     @classmethod
     def _base_value_post_validator(
@@ -1395,7 +1563,7 @@ class BaseChoicesOption(BaseInputOption):
     # We do not declare `choices` here to be able to declare other fields before `choices` and acces their values in `choices` validators
     # choices: Union[dict[str, Any], list[Any], None]
 
-    @validator("choices", pre=True, check_fields=False)
+    @field_validator("choices", mode="before", check_fields=False)
     def parse_comalist_choices(value: Any) -> Union[dict[str, Any], list[Any], None]:
         if isinstance(value, str):
             values = [value.strip() for value in value.split(",")]
@@ -1503,8 +1671,16 @@ class TagsOption(BaseChoicesOption):
     choices: Union[list[str], None] = None
     pattern: Union[Pattern, None] = None
     icon: Union[str, None] = None
-    default: Union[str, list[str], None]
-    _annotation = str
+    default: Union[str, list[str], None] = None
+    # _annotation = str
+
+    @property
+    def _annotation(self) -> Annotated:
+        t = NumberOption()._annotation
+        return Annotated[
+            list[int | float] if not self.optional else list[int | float] | None,
+            ListConstraints(type=t),
+        ]
 
     @staticmethod
     def humanize(value, option={}) -> str:
@@ -1599,7 +1775,7 @@ class DomainOption(BaseChoicesOption):
     filter: Literal[None] = None
     choices: Union[dict[str, str], None]
 
-    @validator("choices", pre=True, always=True)
+    @field_validator("choices", mode="before")
     def inject_domains_choices(
         cls, value: Union[dict[str, str], None], values: Values
     ) -> dict[str, str]:
@@ -1612,7 +1788,7 @@ class DomainOption(BaseChoicesOption):
             for domain in data["domains"]
         }
 
-    @validator("default", pre=True, always=True)
+    @field_validator("default", mode="before")
     def inject_default(
         cls, value: Union[str, None], values: Values
     ) -> Union[str, None]:
@@ -1656,7 +1832,7 @@ class AppOption(BaseChoicesOption):
     add_yunohost_portal_to_choices: bool = False
     choices: Union[dict[str, str], None]
 
-    @validator("choices", pre=True, always=True)
+    @field_validator("choices", mode="before")
     def inject_apps_choices(
         cls, value: Union[dict[str, str], None], values: Values
     ) -> dict[str, str]:
@@ -1675,7 +1851,9 @@ class AppOption(BaseChoicesOption):
         value = {"_none": "---"}
 
         if values.get("add_yunohost_portal_to_choices", False):
-            value["_yunohost_portal_with_public_apps"] = "YunoHost's portal with public apps"
+            value[
+                "_yunohost_portal_with_public_apps"
+            ] = "YunoHost's portal with public apps"
 
         value.update(
             {
@@ -1706,7 +1884,8 @@ class UserOption(BaseChoicesOption):
     filter: Literal[None] = None
     choices: Union[dict[str, str], None]
 
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def inject_users_choices_and_default(cls, values: Values) -> Values:
         # TODO remove calls to resources in validators (pydantic V2 should adress this)
         from yunohost.user import user_list
@@ -1757,7 +1936,7 @@ class GroupOption(BaseChoicesOption):
     choices: Union[dict[str, str], None]
     default: Union[Literal["visitors", "all_users", "admins"], None] = "all_users"
 
-    @validator("choices", pre=True, always=True)
+    @field_validator("choices", mode="before")
     def inject_groups_choices(
         cls, value: Union[dict[str, str], None], values: Values
     ) -> dict[str, str]:
@@ -1778,7 +1957,7 @@ class GroupOption(BaseChoicesOption):
 
         return {groupname: _human_readable_group(groupname) for groupname in groups}
 
-    @validator("default", pre=True, always=True)
+    @field_validator("default", mode="before")
     def inject_default(cls, value: Union[str, None], values: Values) -> str:
         # FIXME do we really want to default to something all the time?
         if value is None:
@@ -1844,6 +2023,8 @@ AnyOption = Union[
 # │  ╵  ╰─╯╵ ╰╵╵╵                                         │
 # ╰───────────────────────────────────────────────────────╯
 
+from pydantic import ConfigDict
+
 
 class OptionsModel(BaseModel):
     # Pydantic will match option types to their models class based on the "type" attribute
@@ -1868,11 +2049,11 @@ class OptionsModel(BaseModel):
                 option["optional"] = option.get("optional", optional)
 
             # LEGACY (`choices` in option `string` used to be valid)
-            if "choices" in option and option["type"] == OptionType.string:
-                logger.warning(
-                    f"Packagers: option {id_} has 'choices' but has type 'string', use 'select' instead to remove this warning."
-                )
-                option["type"] = OptionType.select
+            # if "choices" in option and option["type"] == OptionType.string:
+            #     logger.warning(
+            #         f"Packagers: option {id_} has 'choices' but has type 'string', use 'select' instead to remove this warning."
+            #     )
+            #     option["type"] = OptionType.select
 
             options_list.append(option)
 
@@ -1902,14 +2083,20 @@ class OptionsModel(BaseModel):
                     option.ask = option.id
 
 
-class FormModel(BaseModel):
+class FormModel(
+    BaseModel,
+    # validate_default=True,
+    validate_assignment=True,
+    coerce_numbers_to_str=True,
+    arbitrary_types_allowed=True,
+):
     """
     Base form on which dynamic forms are built upon Options.
     """
 
-    class Config:
-        validate_assignment = True
-        extra = Extra.ignore
+    # class Config:
+    #     validate_assignment = True
+    #     extra = Extra.ignore
 
     def __getitem__(self, name: str) -> Any:
         # FIXME
@@ -1918,10 +2105,10 @@ class FormModel(BaseModel):
         # Also since `BaseReadonlyOption`s do not end up in form,
         # `form[AlertOption.id]` would also triggers an error
         # For convinience in those 2 cases, we return `None`
-        if not hasattr(self, name):
-            # Return None to trigger a validation error instead for required fields
-            return None
-
+        # if not hasattr(self, name):
+        #     raise Exception("")
+        # # Return None to trigger a validation error instead for required fields
+        # return None
         return getattr(self, name)
 
     def __setitem__(self, name: str, value: Any) -> None:
@@ -1936,36 +2123,48 @@ class FormModel(BaseModel):
 
 def build_form(
     options: Iterable[AnyOption], name: str = "DynamicForm"
-) -> Type[FormModel]:
+) -> Type[BaseModel]:
     """
     Returns a dynamic pydantic model class that can be used as a form.
     Parsing/validation occurs at instanciation and assignements.
     To avoid validation at instanciation, use `my_form.construct(**values)`
     """
-    options_as_fields: Any = {}
-    validators: dict[str, Any] = {}
-
-    for option in options:
-        if not isinstance(option, BaseInputOption):
-            continue  # filter out non input options
-
-        options_as_fields[option.id] = option._as_dynamic_model_field()
-        option_validators = option._validators
-
-        for step in ("pre", "post"):
-            validators[f"{option.id}_{step}_validator"] = validator(
-                option.id, allow_reuse=True, pre=step == "pre"
-            )(option_validators[step])
-
-    return cast(
-        Type[FormModel],
-        create_model(
-            name,
-            __base__=FormModel,
-            __validators__=validators,
-            **options_as_fields,
-        ),
+    return create_model(
+        name,
+        __base__=FormModel,
+        **{
+            option.id: (
+                option._annotation,
+                # FIXME not sure if we should give the default if option is required
+                option.default,  # if option.optional or option.readonly else ...,
+            )  #
+            for option in options
+            if isinstance(option, BaseInputOption)
+        },
     )
+    # options_as_fields: Any = {}
+    # validators: dict[str, Any] = {}
+
+    # for option in options:
+    #     if not isinstance(option, BaseInputOption):
+    #         continue  # filter out non input options
+
+    #     options_as_fields[option.id] = option._as_dynamic_model_field()
+
+    #     for step in ("pre", "post"):
+    #         validators[f"{option.id}_{step}_validator"] = validator(
+    #             option.id, allow_reuse=True, pre=step == "pre"
+    #         )(getattr(option, f"_value_{step}_validator"))
+
+    # return cast(
+    #     Type[FormModel],
+    #     create_model(
+    #         name,
+    #         __base__=FormModel,
+    #         __validators__=validators,
+    #         **options_as_fields,
+    #     ),
+    # )
 
 
 # ╭───────────────────────────────────────────────────────╮
@@ -2031,7 +2230,6 @@ def prompt_or_validate_form(
 ) -> FormModel:
     for option in options:
         interactive = Moulinette.interface.type == "cli" and os.isatty(1)
-
         if isinstance(option, ButtonOption):
             if option.is_visible(context) and option.is_enabled(context):
                 continue
@@ -2054,12 +2252,13 @@ def prompt_or_validate_form(
 
         # if we try to get a `BaseReadonlyOption` value, which doesn't exists in the form,
         # we get `None`
-        value = form[option.id]
+        value = form.get(option.id, option.default)
 
         if isinstance(option, BaseReadonlyOption) or option.readonly:
             if isinstance(option, BaseInputOption):
                 # only update the context with the value
-                context[option.id] = option.normalize(form[option.id])
+                form[option.id] = value
+                context[option.id] = form[option.id]
 
                 # FIXME here we could error out
                 if option.id in prefilled_answers:
@@ -2076,7 +2275,7 @@ def prompt_or_validate_form(
             if option.id in prefilled_answers:
                 value = prefilled_answers[option.id]
             elif interactive:
-                value = option.humanize(value, option)
+                # value = option.humanize(value, option)
                 choices = (
                     option.choices if isinstance(option, BaseChoicesOption) else []
                 )
@@ -2091,13 +2290,16 @@ def prompt_or_validate_form(
                 )
 
             # Apply default value if none
-            if value is None or value == "" and option.default is not None:
+            if value == "" and option.default is not None:
                 value = option.default
+            # if value is None or value == "" and option.default is not None:
+            #     value = option.default
 
             try:
                 # Normalize and validate
-                form[option.id] = option.normalize(value, option)
+                form[option.id] = value
                 context[option.id] = form[option.id]
+                # breakpoint()
             except (ValidationError, YunohostValidationError) as e:
                 if isinstance(e, ValidationError):
                     # TODO: handle multiple errors
@@ -2148,7 +2350,8 @@ def prompt_or_validate_form(
             for option_id, value in values.items():
                 option = next(opt for opt in options if option.id == option_id)
                 if option and isinstance(option, BaseInputOption):
-                    form[option.id] = option.normalize(value, option)
+                    # form[option.id] = option.normalize(value, option)
+                    form[option.id] = value
                     context[option.id] = form[option.id]
 
     return form
@@ -2184,14 +2387,21 @@ def ask_questions_and_parse_answers(
         answers = {}
 
     context = {**current_values, **answers}
-
     model_options = parse_raw_options(raw_options, serialize=False)
     # Build the form from those questions and instantiate it without
     # parsing/validation (construct) since it may contains required questions.
-    form = build_form(model_options).construct()
-    form = prompt_or_validate_form(
-        model_options, form, prefilled_answers=answers, context=context, hooks=hooks
-    )
+    form = build_form(model_options).model_construct()
+    try:
+        form = prompt_or_validate_form(
+            model_options, form, prefilled_answers=answers, context=context, hooks=hooks
+        )
+    except Exception as e:
+        # raise YunohostValidationError(error, raw_msg=True)
+        # breakpoint()
+        if isinstance(e, ValidationError):
+            raise YunohostValidationError(e, raw_msg=True)
+        raise e
+
     return (model_options, form)
 
 
